@@ -12,7 +12,7 @@ use std::any::Any;
 use std::cell::Cell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
-use std::sync::{Arc, Mutex, Once, ONCE_INIT};
+use std::sync::{Arc, Mutex, Once, ONCE_INIT, RwLock};
 use std::sync::atomic::{AtomicUsize, ATOMIC_USIZE_INIT, Ordering};
 use std::thread;
 use std::mem;
@@ -21,7 +21,7 @@ use unwind;
 use util::leak;
 
 pub struct Registry {
-    thread_infos: Vec<ThreadInfo>,
+    thread_infos: RwLock<Vec<ThreadInfo>>,
     state: Mutex<RegistryState>,
     sleep: Sleep,
     job_uninjector: Stealer<JobRef>,
@@ -108,9 +108,9 @@ impl Registry {
         let stealers: Vec<_> = workers.iter().map(|d| d.stealer()).collect();
 
         let registry = Arc::new(Registry {
-            thread_infos: stealers.into_iter()
+            thread_infos: RwLock::new(stealers.into_iter()
                 .map(|s| ThreadInfo::new(s))
-                .collect(),
+                .collect()),
             state: Mutex::new(RegistryState::new(inj_worker)),
             sleep: Sleep::new(),
             job_uninjector: inj_stealer,
@@ -173,6 +173,36 @@ impl Registry {
         }
     }
 
+    pub fn add_threads<F>(self: Arc<Self>, num: usize, stack_size: Option<usize>, thread_namer: Option<F>)
+        where F: FnMut(usize) -> String + 'static
+    {
+        let workers: Vec<_> = (0..num)
+            .map(|_| Deque::new())
+            .collect();
+        let stealers: Vec<_> = workers.iter().map(|d| d.stealer()).collect();
+        self.thread_infos.write().unwrap().extend(
+            stealers.into_iter()
+            .map(|s| ThreadInfo::new(s))
+        );
+        for (index, worker) in workers.into_iter().enumerate() {
+            let registry = self.clone();
+            let mut b = thread::Builder::new();
+            if let Some(name) = thread_namer.as_mut().map(|c| c(index)) {
+                b = b.name(name);
+            }
+            if let Some(stack_size) = stack_size {
+                b = b.stack_size(stack_size);
+            }
+            b.spawn(move || unsafe { main_loop(worker, registry, index, breadth_first) }).unwrap();
+        }
+    }
+
+    pub fn remove_threads(&self, num: usize) {
+        let thread_infos = self.thread_infos.write().unwrap();
+        assert!(num <= thread_infos.len());
+        
+    }
+
 
     /// Returns an opaque identifier for this registry.
     pub fn id(&self) -> RegistryId {
@@ -182,7 +212,7 @@ impl Registry {
     }
 
     pub fn num_threads(&self) -> usize {
-        self.thread_infos.len()
+        self.thread_infos.read().unwrap().len()
     }
 
     pub fn handle_panic(&self, err: Box<Any + Send>) {
@@ -206,7 +236,7 @@ impl Registry {
     /// you can get more consistent numbers by having everything
     /// "ready to go".
     pub fn wait_until_primed(&self) {
-        for info in &self.thread_infos {
+        for info in self.thread_infos.read().unwrap().iter() {
             info.primed.wait();
         }
     }
@@ -215,7 +245,7 @@ impl Registry {
     /// -- so we can check that termination actually works.
     #[cfg(test)]
     pub fn wait_until_stopped(&self) {
-        for info in &self.thread_infos {
+        for info in self.thread_infos.read().unwrap().iter() {
             info.stopped.wait();
         }
     }
@@ -598,8 +628,9 @@ impl WorkerThread {
         // we only steal when we don't have any work to do locally
         debug_assert!(self.worker.pop().is_none());
 
+        let thread_infos = self.registry.thread_infos.read().unwrap();
         // otherwise, try to steal
-        let num_threads = self.registry.thread_infos.len();
+        let num_threads = thread_infos.len();
         if num_threads <= 1 {
             return None;
         }
@@ -609,7 +640,7 @@ impl WorkerThread {
             .chain(0 .. start)
             .filter(|&i| i != self.index)
             .filter_map(|victim_index| {
-                let victim = &self.registry.thread_infos[victim_index];
+                let victim = &thread_infos[victim_index];
                 loop {
                     match victim.stealer.steal() {
                         Steal::Empty => return None,
@@ -644,7 +675,7 @@ unsafe fn main_loop(worker: Deque<JobRef>,
     WorkerThread::set_current(&worker_thread);
 
     // let registry know we are ready to do work
-    registry.thread_infos[index].primed.set();
+    registry.thread_infos.read().unwrap()[index].primed.set();
 
     // Worker threads should not panic. If they do, just abort, as the
     // internal state of the threadpool is corrupted. Note that if
@@ -669,7 +700,7 @@ unsafe fn main_loop(worker: Deque<JobRef>,
     debug_assert!(worker_thread.take_local_job().is_none());
 
     // let registry know we are done
-    registry.thread_infos[index].stopped.set();
+    registry.thread_infos.read().unwrap()[index].stopped.set();
 
     // Normal termination, do not abort.
     mem::forget(abort_guard);
